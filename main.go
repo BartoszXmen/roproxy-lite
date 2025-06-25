@@ -55,14 +55,14 @@ func requestHandler(ctx *fasthttp.RequestCtx) {
         return
     }
 
-    // Wysłanie zapytania do odpowiedniej subdomeny Roblox
-    response := makeRequest(ctx, service, rest, 1)
-    defer fasthttp.ReleaseResponse(response)
+    // Wysłanie zapytania do odpowiedniej subdomeny Roblox bez rekursji
+    resp := iterativeRequest(ctx, service, rest)
+    defer fasthttp.ReleaseResponse(resp)
 
     // Kopiowanie statusu, nagłówków i ciała odpowiedzi
-    ctx.SetStatusCode(response.StatusCode())
-    ctx.SetBody(response.Body())
-    response.Header.VisitAll(func(key, value []byte) {
+    ctx.SetStatusCode(resp.StatusCode())
+    ctx.SetBody(resp.Body())
+    resp.Header.VisitAll(func(key, value []byte) {
         ctx.Response.Header.Set(string(key), string(value))
     })
 }
@@ -128,39 +128,45 @@ func parsePath(ctx *fasthttp.RequestCtx) (service string, rest string, err error
     return service, rest, nil
 }
 
-// makeRequest próbuje wysłać req do https://<service>.roblox.com/<path>, z retry
-func makeRequest(ctx *fasthttp.RequestCtx, service, path string, attempt int) *fasthttp.Response {
-    if attempt > retries {
-        resp := fasthttp.AcquireResponse()
-        resp.SetBody([]byte("Proxy failed to connect. Please try again."))
-        resp.SetStatusCode(fasthttp.StatusInternalServerError)
-        return resp
-    }
+// iterativeRequest próbuje wysłać req do https://<service>.roblox.com/<path> z pętlą retry bez rekursji
+func iterativeRequest(ctx *fasthttp.RequestCtx, service, path string) *fasthttp.Response {
+    var resp *fasthttp.Response
+    for attempt := 1; attempt <= retries; attempt++ {
+        req := fasthttp.AcquireRequest()
+        resp = fasthttp.AcquireResponse()
 
-    req := fasthttp.AcquireRequest()
-    defer fasthttp.ReleaseRequest(req)
+        // Budowanie URL docelowego
+        req.SetRequestURI("https://" + service + ".roblox.com/" + path)
+        req.Header.SetMethod(string(ctx.Method()))
 
-    // Budowanie URL docelowego (z subdomeną i ścieżką)
-    req.SetRequestURI("https://" + service + ".roblox.com/" + path)
-    req.Header.SetMethod(string(ctx.Method()))
+        // Kopiowanie nagłówków od klienta
+        ctx.Request.Header.VisitAll(func(key, value []byte) {
+            req.Header.Set(string(key), string(value))
+        })
+        // Dodanie/zmiana nagłówków
+        req.Header.Set("Accept", "application/json")
+        if key := os.Getenv("KEY"); key != "" {
+            req.Header.Set("PROXYKEY", key)
+        }
+        req.Header.Set("User-Agent", "RoProxy")
+        req.Header.Del("Roblox-Id")
 
-    // Kopiowanie nagłówków od klienta
-    ctx.Request.Header.VisitAll(func(key, value []byte) {
-        req.Header.Set(string(key), string(value))
-    })
-    // Dodanie/zmiana nagłówków
-    req.Header.Set("Accept", "application/json")
-    if key := os.Getenv("KEY"); key != "" {
-        req.Header.Set("PROXYKEY", key)
-    }
-    req.Header.Set("User-Agent", "RoProxy")
-    req.Header.Del("Roblox-Id")
+        // Wykonanie request
+        err := client.Do(req, resp)
+        fasthttp.ReleaseRequest(req)
 
-    resp := fasthttp.AcquireResponse()
-    if err := client.Do(req, resp); err != nil {
+        if err == nil {
+            break // udało się, wychodzimy z pętli
+        }
+        // jeśli błąd, zwalniamy resp i próbujemy ponownie
         fasthttp.ReleaseResponse(resp)
-        // Retry przy błędzie sieci
-        return makeRequest(ctx, service, path, attempt+1)
+        time.Sleep(100 * time.Millisecond) // krótka pauza między próbami
+    }
+
+    if resp == nil {
+        resp = fasthttp.AcquireResponse()
+        resp.SetStatusCode(fasthttp.StatusInternalServerError)
+        resp.SetBody([]byte("Proxy failed to connect. Please try again."))
     }
     return resp
 }
